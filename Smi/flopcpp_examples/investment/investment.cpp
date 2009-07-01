@@ -1,6 +1,20 @@
-/** \file liquidity.cpp
-	\brief Implementation of a liquidity constrained options pricing model
-	\author Alan King and Mark Squillante
+/** \file investment.cpp
+	\brief Implementation of the investment model, using Smi and FlopC++
+	\author Michal Kaut
+
+	This version uses FlopC++ to construct the core model and then Smi to
+	construct the scenario-tree structure (using FlopC++ to get the relevant
+	column and row indices). It is basically a combination of the Smi and FlopC++
+	(with stage-node objects) examples. Note that we use the stage-node objects
+	directly from the FlopC++ example, which means that they are more general
+	than needed in this case (where we only construct a deterministic model, so
+	all non-leaf nodes only have one child).
+
+	Note that the code is meant as an illustrative example that mixes different
+	styles to show more ways of doing things, something you most likely do \e not
+	want to do in a real code. In addition, in a real code one would probably
+	make the members private and write get/set methods where needed. This has
+	been omitted here to make the example shorter.
 */
 
 #include <iomanip>
@@ -43,7 +57,7 @@ public:
 				ptParent->children.push_back(this); // Register with the parent
 			}
 		}
-		~StageNodeBase() {
+		virtual ~StageNodeBase() {
 			for (int a = 0; a < (int) all_variables.size(); a++) {
 				delete all_variables[a];
 			}
@@ -92,23 +106,23 @@ class StageNode : public StageNodeBase
 
 		MP_set ASSETS;                ///< set of assets
 		MP_index a;                   ///< index used in formulas
-		MP_variable theta;            ///< the "portfolio" variable, defined on ASSETS
+		MP_variable x;                ///< the "buy" variable, defined on ASSETS
 
-		/// A common way to access the self-financing constraints in the derived classes
-		/** Two of the derived classes have a self-financing balance constraint with
+		/// A common way to access the balance constraints in the derived classes
+		/** Two of the derived classes have a cash-flow balance constraint with
 		    the \a Return values in it. These constraints have to be accessed when
 		    creating scenarios and without this common handle, we would need to
 		    write a separate code for the two classes. **/
-		MP_constraint *selffin_constraint;
+		MP_constraint *balance_constraint;
 		///@}
 
 
 		/// get the wealth at the nodes
-		/** We cannot use theta.level(), because this is linked to the core model,
+		/** We cannot use x.level(), because this is linked to the core model,
 		    not the stochastic model. Instead, we provide the function with the
 		    current values of the node's variables. Note that in general, we might
 		    have to provide the values of stochastic data as well. <br>
-		    By default, the wealth is the sum of all the \a theta variables, so it must
+		    By default, the wealth is the sum of all the \a x variables, so it must
 		    be overridden in the leaves. **/
 		virtual double get_wealth(const double *variableValues, const int nmbVars) {
 			assert (nmbVars == (int) all_variables.size()
@@ -123,12 +137,10 @@ class StageNode : public StageNodeBase
 		virtual void loadModifiedMatrix(CoinPackedMatrix &ADiff, double *retData)
 		{
 			// Find row and column number of the matrix elements with Return values
-			int i = selffin_constraint->row_number();
+			int i = balance_constraint->row_number();
 			for (int a=0; a<ASSETS.size(); a++) {
-				// Returns are on 'theta' variables from the parent!
-				int jminus = this->getParent()->theta(a).getColumn();
-				int j      = this->theta(a).getColumn();
-				ADiff.modifyCoefficient(i, jminus, -1.0*retData[a]);
+				// Returns are on 'x' variables from the parent!
+				int j = this->getParent()->x(a).getColumn();
 				ADiff.modifyCoefficient(i, j, retData[a]);
 			}
 		}
@@ -140,16 +152,16 @@ class RootNode : public StageNode {
 	public:
 		MP_constraint initialBudget; ///< initial budget constraint
 
-		RootNode(const int nmbAssets, const double initWealth, double *initPrice)
+		RootNode(const int nmbAssets, const double initWealth)
 		: StageNode(NULL, nmbAssets, 0, 1.0)
 		{
-			initialBudget() = sum(ASSETS, theta(ASSETS)) == initWealth;
+			initialBudget() = sum(ASSETS, x(ASSETS)) == initWealth;
 
 			for (int a = 0; a < nmbAssets; a++) {
 				all_variables.push_back(new VariableRef(x(a)));
 			}
 			all_constraints.push_back(&initialBudget);
-			selffin_constraint = NULL;
+			balance_constraint = NULL;
 		}
 
 		/// This is the public interface to the protected \c make_obj_function_()
@@ -186,7 +198,7 @@ class MidStageNode : public StageNode {
 				all_variables.push_back(new VariableRef(x(a)));
 			}
 			all_constraints.push_back(&cashFlowBalance);
-			selffin_constraint = &cashFlowBalance;
+			balance_constraint = &cashFlowBalance;
 		}
 };
 
@@ -217,7 +229,7 @@ class LeafNode : public StageNode {
 			all_variables.push_back(new VariableRef(w()));
 			all_variables.push_back(new VariableRef(y()));
 			all_constraints.push_back(&finalBalance);
-			selffin_constraint = &finalBalance;
+			balance_constraint = &finalBalance;
 		}
 
 		/// get the wealth at the leaf - has to override the default from StageNode
@@ -262,19 +274,29 @@ class ScenTreeStruct {
 
 		/// Get the number of stages
 		virtual int get_nmb_stages() const = 0;
+
 };
 
 /// Class for balanced binary trees
 class BinTreeStruct : public ScenTreeStruct {
 	protected:
 		int nmbStages;
+		int * scenNodeNmb;
+		int nextLeaf;
+
 
 	public:
 		/// Constructs the object - 2^T-1 nodes, first leaf is 2^(T-1)-1
 		BinTreeStruct(const int T)
 		: ScenTreeStruct((int) pow(2.0, T) - 1, (int) pow(2.0, T-1) - 1),
 			nmbStages(T)
-		{}
+		{
+			scenNodeNmb = new int[T];
+			nextLeaf = this->firstLeaf;
+		}
+		~BinTreeStruct(){
+			delete scenNodeNmb;
+		}
 
 		int get_parent(int n) const {
 			return (n-1) / 2;    // This gives: get_parent(0) = 0
@@ -282,6 +304,40 @@ class BinTreeStruct : public ScenTreeStruct {
 
 		int get_nmb_stages() const {
 			return nmbStages;
+		}
+
+		int * getCoreScenario(){
+			int n = this->firstLeaf;
+			for (int t = nmbStages; t > 0; t--) {
+				scenNodeNmb[t-1] = n;
+				n = this->get_parent(n);
+			}
+			return scenNodeNmb;
+		}
+
+		int * getNextScenario(int *scen, int* parentScen, int *branchStage, double *prob){
+			if (nextLeaf == nmbNodes)
+				return NULL;
+			int n = nextLeaf;
+			int t = nmbStages-1;
+			// For each scenario, start by adding the leaf and then go up, as long as
+			// the nodes are different from the previous (parent) scenario
+			while (n != scenNodeNmb[t]) {
+				assert (n > 0 && t > 0 && "All scenarios must end in a common root");
+				scenNodeNmb[t] = n; // add the current node to the list
+				n = this->get_parent(n);
+				t--;
+			}
+			*scen = nextLeaf - this->firstLeaf;         // scenario index
+			*parentScen = (*scen == 0 ? 0 : *scen - 1); // parent scenario
+			*branchStage = (*scen == 0 ? 1 : t+1);      // branching scenario
+		 	*prob = 1.0 / this->getNmbScen();           // equiprobable scen.
+		 	nextLeaf++;
+			return scenNodeNmb;
+		}
+
+		inline int getNmbScen()	{
+			return this->nmbNodes - this->firstLeaf;
 		}
 };
 
@@ -326,22 +382,18 @@ int main()
 	// Initialize the object for the core (deterministic) model
 	MP_model &coreModel = MP_model::getDefaultModel();
 	coreModel.setSolver(new OSI_SOLVER_INTERFACE);
-	coreModel.silent(); // less output
+	coreModel.verbose(); // less output
 
-	int i, j, n, t;
+	int i, j, t;
 	assert (nmbStages == scTree.get_nmb_stages()
 	        && "Checking that get_nmb_stages() returns what it should.");
 
-	vector<int> scenNodeNmb(nmbStages); // nodes (indices) in a scenario
-	n = scTree.firstLeaf;               // leaf of the first scenario
-	for (t = nmbStages; t > 0; t--) {
-		scenNodeNmb[t-1] = n;
-		n = scTree.get_parent(n);
-	}
+	// Get the node numbers for the Core
+	int * scenNodeNmb = scTree.getCoreScenario();
 
 	// Create scenario tree for the core model, using data for the 1st scenario
 	vector<StageNode *> coreNodes(nmbStages);
-	coreNodes[0] = new RootNode(nmbAssets, InitBudget, initialPrice);
+	coreNodes[0] = new RootNode(nmbAssets, InitBudget);
 	for (t = 1; t < nmbStages-1; t++) {
 		coreNodes[t] = new MidStageNode(coreNodes[t-1], t, 1.0,
 		                                retData[scenNodeNmb[t]-1]);
@@ -427,40 +479,28 @@ int main()
 	// row-ordering; it would be done automatically later, but this is faster...
 	ADiff.reverseOrdering();
 
-	int nmbScen = scTree.nmbNodes - scTree.firstLeaf; // number of scenarios
- 	double scenProb = 1.0 / nmbScen;                  // equiprobable scen.
-
 	// Add scenarios, one by one.
-	// For each scenario, start by adding the leaf and then go up, as long as
-	// the nodes are different from the previous (parent) scenario
-	for (int leaf = scTree.firstLeaf; leaf < scTree.nmbNodes; leaf++) {
-		int scen = leaf - scTree.firstLeaf; // scenario index
-		n = leaf;                           // the current node to be added
-		t = nmbStages-1;                    // stage of node n
-		cout << "Nodes in scenario " << scen + 1 << ": ";
+	int scen,parentScen,branchStage;
+	double scenProb;
+	while(scenNodeNmb = scTree.getNextScenario(&scen,&parentScen,&branchStage,&scenProb)){
 		ADiff.clear(); // clean the matrix of differences - must reset dimensions!
 		ADiff.setDimensions(nmbCoreRows, nmbCoreCols);
-		while (n != scenNodeNmb[t]) {
-			assert (n > 0 && t > 0 && "All scenarios must end in a common root");
-			cout << setw(2) << n << " ";
-			scenNodeNmb[t] = n; // add the current node to the list
-			coreNodes[t]->loadModifiedMatrix(ADiff,retData[n-1]);  // load modified data into ADiff
-			// Move one node up in the scenario tree
-			n = scTree.get_parent(n);
-			t--;
+		cout << "Nodes in scenario " << scen + 1 << ": ";
+		for (t=branchStage; t<nmbStages; t++){
+				cout << setw(2) << scenNodeNmb[t] << " ";
+				// load modified data into ADiff
+				coreNodes[t]->loadModifiedMatrix(ADiff,retData[scenNodeNmb[t]-1]);
 		}
 		cout << endl;
 
-		// Add the scenario to the Smi model
-		int branchStage = (scen == 0 ? 1 : t+1);
-		int parentScen = (scen == 0 ? 0 : scen - 1); // parent scenario
 		#ifdef NDEBUG
 			stochModel.generateScenario(&stochCore, &ADiff,
-																	NULL, NULL, NULL, NULL, NULL,
-																	branchStage, parentScen, scenProb);
+					NULL, NULL, NULL, NULL, NULL,
+					branchStage, parentScen, scenProb);
 		#else
 			int scenIndx = stochModel.generateScenario(&stochCore, &ADiff,
-				NULL, NULL, NULL, NULL, NULL,branchStage, parentScen,scenProb);
+					NULL, NULL, NULL, NULL, NULL,
+					branchStage, parentScen,scenProb);
 			assert (scenIndx == scen && "Check index of the new scenario");
 		#endif
 	}
@@ -492,7 +532,7 @@ int main()
 	   the solution on the scenario tree, using the SMI (stochastic) model */
 	cout << endl << "The stochastic model has " << stochModel.getNumScenarios()
 	     << " scenarios." << endl;
-	assert (stochModel.getNumScenarios() == nmbScen && "Check number of scens.");
+	assert (stochModel.getNumScenarios() == scTree.getNmbScen() && "Check number of scens.");
 
 	// We will report the wealth at each node of the tree, plus the obj. value
 	vector<double> nodeWealth(nmbStages, 0);
@@ -502,7 +542,7 @@ int main()
 	const double *ptOsiSolution = ptDetEqModel->getColSolution();
 
 	// Compute the wealth at each node, by traversing the tree from leafs up
-	for (SmiScenarioIndex sc = 0; sc < nmbScen; sc ++) {
+	for (SmiScenarioIndex sc = 0; sc < scTree.getNmbScen(); sc ++) {
 		// Get the leaf node of scenario sc:
 		SmiScnNode *ptNode = stochModel.getLeafNode(sc);
 		int nodeStage = nmbStages;
