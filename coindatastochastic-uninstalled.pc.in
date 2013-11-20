@@ -1,0 +1,8 @@
+datadir=@ABSBUILDDIR@
+
+Name: Stochastic
+Description: Stochastic models
+URL: https://projects.coin-or.org/svn/Data/Stochastic
+Version: @PACKAGE_VERSION@
+Libs:
+Cflags:
