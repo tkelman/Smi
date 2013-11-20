@@ -1,0 +1,20 @@
+NAME          MYSMPS                
+ROWS                                
+ N  OBJECTRW                        
+ G  R0000001                        
+ G  R0000002                        
+ G  R0000003                        
+ G  R0000004                        
+ E  R0000005                        
+ E  R0000006                        
+COLUMNS                             
+    C0000001  OBJECTRW  -12.           R0000001  1.          
+    C0000002  OBJECTRW  -20.           R0000002  1.          
+    C0000003  OBJECTRW  -18.           R0000003  1.          
+    C0000004  OBJECTRW  -40.           R0000004  1.          
+    C0000005  OBJECTRW  5.             R0000005  -1.         
+    C0000006  R0000005  1.          
+    C0000007  OBJECTRW  10.            R0000006  -1.         
+    C0000008  R0000006  1.          
+RHS                                 
+ENDATA                              
